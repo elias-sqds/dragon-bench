@@ -1,20 +1,22 @@
+use clap::Parser;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, error::Error};
-use clap::Parser;
 
 use futures::stream::StreamExt;
 use solana_client::nonblocking::rpc_client::{self, RpcClient};
+use solana_client::rpc_config::RpcBlockConfig;
 use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::signature::Signature;
+use solana_transaction_status::{EncodedTransaction, TransactionDetails};
 use tokio::sync::Mutex;
 use tokio::time;
 use tracing::{Level, error, info, instrument};
 use tracing_subscriber::FmtSubscriber;
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
-use yellowstone_grpc_proto::geyser::{SubscribeRequest, SubscribeRequestFilterTransactions, SubscribeRequestFilterBlocksMeta};
-use solana_transaction_status::{EncodedTransaction, TransactionDetails};
-use solana_client::rpc_config::RpcBlockConfig;
+use yellowstone_grpc_proto::geyser::{
+    SubscribeRequest, SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterTransactions,
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -61,37 +63,42 @@ struct TestStats {
 async fn run_test(duration_minutes: u64) -> Result<(), Box<dyn Error>> {
     dotenv::dotenv().ok();
 
-    info!("Starting Dragon's Mouth stream connection test for {} minutes", duration_minutes);
+    info!(
+        "Starting Dragon's Mouth stream connection test for {} minutes",
+        duration_minutes
+    );
 
     // Configure the Dragon's Mouth gRPC client
     // uncomment to test with Helius RPC url
     // let rpc_url = std::env::var("HELIUS_RPC_URL").expect("HELIUS_RPC_URL is not set");
-    let triton_rpc_base_url = std::env::var("TRITON_RPC_BASE_URL").expect("TRITON_RPC_BASE_URL is not set");
-    let triton_rpc_api_token = std::env::var("TRITON_RPC_API_TOKEN").expect("TRITON_RPC_API_TOKEN is not set");
+    let rpc_url=
+        std::env::var("TRITON_RPC_URL").expect("TRITON_RPC_BASE_URL is not set");
 
-    let dragon_mouth_base_url = std::env::var("DRAGONS_MOUTH_BASE_URL").expect("DRAGONS_MOUTH_BASE_URL is not set");
-    let dragon_mouth_grpc_token = std::env::var("DRAGONS_MOUTH_TOKEN").expect("DRAGONS_MOUTH_TOKEN is not set");
-    
-    let rpc_url = format!("{}/{}", triton_rpc_base_url, triton_rpc_api_token);
+    let dragon_mouth_base_url =
+        std::env::var("DRAGONS_MOUTH_BASE_URL").expect("DRAGONS_MOUTH_BASE_URL is not set");
+    let dragon_mouth_grpc_token =
+        std::env::var("DRAGONS_MOUTH_TOKEN").expect("DRAGONS_MOUTH_TOKEN is not set");
+ 
     let rpc_client = Arc::new(rpc_client::RpcClient::new(rpc_url));
 
-    info!("Connecting to Dragon's Mouth at {}", triton_rpc_base_url);
+    info!("Connecting to Dragon's Mouth at {}", dragon_mouth_base_url);
 
     let tls_config = ClientTlsConfig::new().with_native_roots();
-    let mut client = GeyserGrpcClient::build_from_shared(dragon_mouth_base_url).expect("build_from_shared failed")
-        .x_token(Some(dragon_mouth_grpc_token))
-        .expect("x-token failed")
-        .tls_config(tls_config)
-        .expect("tls config failed")
-        .connect()
-        .await
-        .expect("Failed to connect to geyser");
+    let mut client =
+        GeyserGrpcClient::build_from_shared(dragon_mouth_base_url)
+            .expect("build_from_shared failed")
+            .x_token(Some(dragon_mouth_grpc_token))
+            .expect("x-token failed")
+            .tls_config(tls_config)
+            .expect("tls config failed")
+            .connect()
+            .await
+            .expect("Failed to connect to geyser");
 
     let mut transactions_map = HashMap::new();
     transactions_map.insert(
         "transactions".to_string(),
         SubscribeRequestFilterTransactions {
-            // vote: Some(false),
             failed: Some(false),
             ..Default::default()
         },
@@ -121,7 +128,7 @@ async fn run_test(duration_minutes: u64) -> Result<(), Box<dyn Error>> {
 
     let blocks = Arc::new(Mutex::new(HashMap::<u64, BlockInfo>::new()));
     let blocks_clone = blocks.clone();
-    
+
     // Create a cancellation token for graceful shutdown
     let (shutdown_send, shutdown_recv) = tokio::sync::oneshot::channel::<()>();
     let shutdown_send = Arc::new(Mutex::new(Some(shutdown_send)));
@@ -130,7 +137,10 @@ async fn run_test(duration_minutes: u64) -> Result<(), Box<dyn Error>> {
     let shutdown_send_clone = shutdown_send.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(duration_minutes * 60)).await;
-        info!("Test duration of {} minutes reached, initiating shutdown...", duration_minutes);
+        info!(
+            "Test duration of {} minutes reached, initiating shutdown...",
+            duration_minutes
+        );
         if let Some(sender) = shutdown_send_clone.lock().await.take() {
             let _ = sender.send(());
         }
@@ -143,7 +153,7 @@ async fn run_test(duration_minutes: u64) -> Result<(), Box<dyn Error>> {
         info!("Starting to process stream messages");
 
         let mut shutdown_recv = Some(shutdown_recv);
-        
+
         loop {
             tokio::select! {
                 message = stream.next() => {
@@ -160,7 +170,7 @@ async fn run_test(duration_minutes: u64) -> Result<(), Box<dyn Error>> {
                                         let mut blocks_lock = blocks.lock().await;
                                         let block_data = blocks_lock.entry(slot).or_default();
                                         block_data.transactions.push(signature);
-                                        
+
                                         // tracing::info!("Transaction added to slot {}: {}", slot, signature);
                                     },
                                     yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof::BlockMeta(meta) => {
@@ -211,10 +221,11 @@ async fn run_test(duration_minutes: u64) -> Result<(), Box<dyn Error>> {
         loop {
             interval.tick().await;
             let blocks_lock = blocks_clone.lock().await;
-            let complete_blocks = blocks_lock.iter()
+            let complete_blocks = blocks_lock
+                .iter()
                 .filter(|(_, info)| info.is_complete)
                 .count();
-            
+
             info!(
                 "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
                  📊 Status Update\n\
@@ -257,7 +268,11 @@ async fn verify_block(rpc_client: &Arc<RpcClient>, slot: u64, block_info: &mut B
         Ok(block) => {
             // Count only successful transactions
             let rpc_tx_count_before_filter = block.transactions.clone().unwrap().len();
-            let rpc_tx_count = block.transactions.clone().unwrap().iter()
+            let rpc_tx_count = block
+                .transactions
+                .clone()
+                .unwrap()
+                .iter()
                 .filter(|tx| tx.meta.as_ref().map_or(false, |meta| meta.err.is_none()))
                 .count();
             info!("RPC tx count before filter: {}", rpc_tx_count_before_filter);
@@ -266,12 +281,16 @@ async fn verify_block(rpc_client: &Arc<RpcClient>, slot: u64, block_info: &mut B
             let coverage = geyser_tx_count as f64 / rpc_tx_count as f64 * 100.0;
 
             // Calculate missing transactions first
-            let geyser_tx_set: std::collections::HashSet<_> = block_info.transactions
+            let geyser_tx_set: std::collections::HashSet<_> = block_info
+                .transactions
                 .iter()
                 .map(|sig| sig.to_string())
                 .collect();
 
-            let missing_txs: Vec<_> = block.transactions.unwrap().iter()
+            let missing_txs: Vec<_> = block
+                .transactions
+                .unwrap()
+                .iter()
                 .filter_map(|tx| {
                     // Skip failed transactions
                     if !tx.meta.as_ref().map_or(false, |meta| meta.err.is_none()) {
@@ -280,13 +299,16 @@ async fn verify_block(rpc_client: &Arc<RpcClient>, slot: u64, block_info: &mut B
 
                     match &tx.transaction {
                         EncodedTransaction::Binary(_, _) | EncodedTransaction::LegacyBinary(_) => {
-                            tx.transaction.decode().map(|decoded_tx| {
-                                decoded_tx.signatures.first().map(|sig| sig.to_string())
-                            }).flatten()
-                        },
+                            tx.transaction
+                                .decode()
+                                .map(|decoded_tx| {
+                                    decoded_tx.signatures.first().map(|sig| sig.to_string())
+                                })
+                                .flatten()
+                        }
                         EncodedTransaction::Json(ui_tx) => {
                             ui_tx.signatures.first().map(|sig| sig.to_string())
-                        },
+                        }
                         _ => None,
                     }
                 })
@@ -321,11 +343,15 @@ async fn verify_block(rpc_client: &Arc<RpcClient>, slot: u64, block_info: &mut B
                  ┃ Coverage           │ {:>6.2}%\n\
                  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
                 slot,
-                if block.blockhash == *block_info.blockhash.as_ref().unwrap() { "✅" } else { "❌" },
+                if block.blockhash == *block_info.blockhash.as_ref().unwrap() {
+                    "✅"
+                } else {
+                    "❌"
+                },
                 rpc_tx_count,
                 geyser_tx_count,
                 missing_count,
-                if !missing_txs.is_empty() { 
+                if !missing_txs.is_empty() {
                     format!("first: {}", missing_txs.first().unwrap())
                 } else {
                     "none".to_string()
@@ -346,19 +372,27 @@ async fn verify_block(rpc_client: &Arc<RpcClient>, slot: u64, block_info: &mut B
                 match rpc_client.get_block_with_config(slot, config).await {
                     Ok(rpc_block) => {
                         // Count only successful transactions
-                        let rpc_tx_count = rpc_block.transactions.clone().unwrap().iter()
+                        let rpc_tx_count = rpc_block
+                            .transactions
+                            .clone()
+                            .unwrap()
+                            .iter()
                             .filter(|tx| tx.meta.as_ref().map_or(false, |meta| meta.err.is_none()))
                             .count();
                         let geyser_tx_count = block_info.transactions.len();
                         let coverage = geyser_tx_count as f64 / rpc_tx_count as f64 * 100.0;
 
                         // Calculate missing transactions first
-                        let geyser_tx_set: std::collections::HashSet<_> = block_info.transactions
+                        let geyser_tx_set: std::collections::HashSet<_> = block_info
+                            .transactions
                             .iter()
                             .map(|sig| sig.to_string())
                             .collect();
 
-                        let missing_txs: Vec<_> = rpc_block.transactions.unwrap().iter()
+                        let missing_txs: Vec<_> = rpc_block
+                            .transactions
+                            .unwrap()
+                            .iter()
                             .filter_map(|tx| {
                                 // Skip failed transactions
                                 if !tx.meta.as_ref().map_or(false, |meta| meta.err.is_none()) {
@@ -366,14 +400,17 @@ async fn verify_block(rpc_client: &Arc<RpcClient>, slot: u64, block_info: &mut B
                                 }
 
                                 match &tx.transaction {
-                                    EncodedTransaction::Binary(_, _) | EncodedTransaction::LegacyBinary(_) => {
-                                        tx.transaction.decode().map(|decoded_tx| {
+                                    EncodedTransaction::Binary(_, _)
+                                    | EncodedTransaction::LegacyBinary(_) => tx
+                                        .transaction
+                                        .decode()
+                                        .map(|decoded_tx| {
                                             decoded_tx.signatures.first().map(|sig| sig.to_string())
-                                        }).flatten()
-                                    },
+                                        })
+                                        .flatten(),
                                     EncodedTransaction::Json(ui_tx) => {
                                         ui_tx.signatures.first().map(|sig| sig.to_string())
-                                    },
+                                    }
                                     _ => None,
                                 }
                             })
@@ -387,7 +424,8 @@ async fn verify_block(rpc_client: &Arc<RpcClient>, slot: u64, block_info: &mut B
                             rpc_tx_count,
                             geyser_tx_count,
                             missing_tx_count: missing_count,
-                            blockhash_match: rpc_block.blockhash == *block_info.blockhash.as_ref().unwrap(),
+                            blockhash_match: rpc_block.blockhash
+                                == *block_info.blockhash.as_ref().unwrap(),
                             coverage_percent: coverage,
                             first_missing_tx: if !missing_txs.is_empty() {
                                 Some(missing_txs.first().unwrap().clone())
@@ -407,11 +445,15 @@ async fn verify_block(rpc_client: &Arc<RpcClient>, slot: u64, block_info: &mut B
                              ┃ Coverage           │ {:>6.2}%\n\
                              ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
                             slot,
-                            if rpc_block.blockhash == *block_info.blockhash.as_ref().unwrap() { "✅" } else { "❌" },
+                            if rpc_block.blockhash == *block_info.blockhash.as_ref().unwrap() {
+                                "✅"
+                            } else {
+                                "❌"
+                            },
                             rpc_tx_count,
                             geyser_tx_count,
                             missing_count,
-                            if !missing_txs.is_empty() { 
+                            if !missing_txs.is_empty() {
                                 format!("first: {}", missing_txs.first().unwrap())
                             } else {
                                 "none".to_string()
@@ -420,7 +462,10 @@ async fn verify_block(rpc_client: &Arc<RpcClient>, slot: u64, block_info: &mut B
                         );
                     }
                     Err(retry_err) => {
-                        error!("Failed to fetch block {} from RPC after retry: {:?}", slot, retry_err);
+                        error!(
+                            "Failed to fetch block {} from RPC after retry: {:?}",
+                            slot, retry_err
+                        );
                     }
                 }
             } else {
@@ -429,8 +474,7 @@ async fn verify_block(rpc_client: &Arc<RpcClient>, slot: u64, block_info: &mut B
                      ❌ Error fetching block {}\n\
                      ┃ {}\n\
                      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                    slot,
-                    err
+                    slot, err
                 );
             }
         }
@@ -439,52 +483,52 @@ async fn verify_block(rpc_client: &Arc<RpcClient>, slot: u64, block_info: &mut B
 
 async fn generate_final_report(blocks: &Arc<Mutex<HashMap<u64, BlockInfo>>>) {
     let blocks_lock = blocks.lock().await;
-    
+
     let mut stats = TestStats {
         total_blocks: blocks_lock.len(),
         min_coverage: 100.0,
         ..Default::default()
     };
-    
+
     let mut coverage_sum = 0.0;
     let mut verified_blocks = 0;
-    
+
     for (_, block_info) in blocks_lock.iter() {
         if block_info.is_complete {
             stats.complete_blocks += 1;
-            
+
             if let Some(result) = &block_info.verification_result {
                 verified_blocks += 1;
                 stats.verified_blocks += 1;
                 stats.total_rpc_txs += result.rpc_tx_count;
                 stats.total_geyser_txs += result.geyser_tx_count;
                 stats.total_missing_txs += result.missing_tx_count;
-                
+
                 coverage_sum += result.coverage_percent;
-                
+
                 if result.coverage_percent < stats.min_coverage {
                     stats.min_coverage = result.coverage_percent;
                 }
-                
+
                 if result.coverage_percent > stats.max_coverage {
                     stats.max_coverage = result.coverage_percent;
                 }
-                
+
                 if result.coverage_percent >= 100.0 {
                     stats.perfect_coverage_blocks += 1;
                 }
-                
+
                 if result.missing_tx_count > 0 {
                     stats.blocks_with_missing_txs += 1;
                 }
             }
         }
     }
-    
+
     if verified_blocks > 0 {
         stats.avg_coverage = coverage_sum / verified_blocks as f64;
     }
-    
+
     // Print the final report
     info!(
         "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
@@ -506,17 +550,37 @@ async fn generate_final_report(blocks: &Arc<Mutex<HashMap<u64, BlockInfo>>>) {
          ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         stats.total_blocks,
         stats.complete_blocks,
-        if stats.total_blocks > 0 { stats.complete_blocks as f64 / stats.total_blocks as f64 * 100.0 } else { 0.0 },
+        if stats.total_blocks > 0 {
+            stats.complete_blocks as f64 / stats.total_blocks as f64 * 100.0
+        } else {
+            0.0
+        },
         stats.verified_blocks,
-        if stats.total_blocks > 0 { stats.verified_blocks as f64 / stats.total_blocks as f64 * 100.0 } else { 0.0 },
+        if stats.total_blocks > 0 {
+            stats.verified_blocks as f64 / stats.total_blocks as f64 * 100.0
+        } else {
+            0.0
+        },
         stats.perfect_coverage_blocks,
-        if stats.verified_blocks > 0 { stats.perfect_coverage_blocks as f64 / stats.verified_blocks as f64 * 100.0 } else { 0.0 },
+        if stats.verified_blocks > 0 {
+            stats.perfect_coverage_blocks as f64 / stats.verified_blocks as f64 * 100.0
+        } else {
+            0.0
+        },
         stats.blocks_with_missing_txs,
-        if stats.verified_blocks > 0 { stats.blocks_with_missing_txs as f64 / stats.verified_blocks as f64 * 100.0 } else { 0.0 },
+        if stats.verified_blocks > 0 {
+            stats.blocks_with_missing_txs as f64 / stats.verified_blocks as f64 * 100.0
+        } else {
+            0.0
+        },
         stats.total_rpc_txs,
         stats.total_geyser_txs,
         stats.total_missing_txs,
-        if stats.total_rpc_txs > 0 { stats.total_missing_txs as f64 / stats.total_rpc_txs as f64 * 100.0 } else { 0.0 },
+        if stats.total_rpc_txs > 0 {
+            stats.total_missing_txs as f64 / stats.total_rpc_txs as f64 * 100.0
+        } else {
+            0.0
+        },
         stats.avg_coverage,
         stats.min_coverage,
         stats.max_coverage
@@ -535,6 +599,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Parse command line arguments
     let args = Args::parse();
 
-    info!("Starting Dragon's Mouth reliability test for {} minutes...", args.duration);
+    info!(
+        "Starting Dragon's Mouth reliability test for {} minutes...",
+        args.duration
+    );
     run_test(args.duration).await
 }
