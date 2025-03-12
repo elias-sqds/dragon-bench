@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::fs::File;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, error::Error};
@@ -12,7 +13,8 @@ use solana_transaction_status::{EncodedTransaction, TransactionDetails};
 use tokio::sync::Mutex;
 use tokio::time;
 use tracing::{Level, error, info, instrument};
-use tracing_subscriber::FmtSubscriber;
+use tracing_subscriber::fmt::writer::MakeWriterExt;
+use tracing_subscriber::prelude::*;
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::geyser::{
     SubscribeRequest, SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterTransactions,
@@ -24,6 +26,10 @@ struct Args {
     /// Duration of the test in minutes
     #[arg(short, long, default_value_t = 10)]
     duration: u64,
+
+    /// flag for running triton or helius dragon mouth
+    #[arg(short = 't', long, default_value_t = false)]
+    triton: bool,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -60,40 +66,70 @@ struct TestStats {
 }
 
 #[instrument]
-async fn run_test(duration_minutes: u64) -> Result<(), Box<dyn Error>> {
+async fn run_test(duration_minutes: u64, triton: bool) -> Result<(), Box<dyn Error>> {
     dotenv::dotenv().ok();
 
+    // Create log file name based on provider
+    let provider_name = if triton { "triton" } else { "helius" };
+    let log_file_name = format!("{}_dragon_mouth_test.log", provider_name);
+
+    // Set up file logger
+    let file = File::create(&log_file_name).expect("Failed to create log file");
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(Arc::new(file))
+        .with_ansi(false)
+        .with_filter(tracing_subscriber::filter::LevelFilter::INFO);
+
+    // Set up console logger
+    let console_layer =
+        tracing_subscriber::fmt::layer().with_writer(std::io::stdout.with_max_level(Level::INFO));
+
+    // Register both layers
+    tracing_subscriber::registry()
+        .with(file_layer)
+        .with(console_layer)
+        .init();
+
     info!(
-        "Starting Dragon's Mouth stream connection test for {} minutes",
-        duration_minutes
+        "Starting Dragon's Mouth stream connection test for {} minutes (Provider: {})",
+        duration_minutes, provider_name
     );
+    info!("Logging to file: {}", log_file_name);
 
-    // Configure the Dragon's Mouth gRPC client
-    // uncomment to test with Helius RPC url
-    // let rpc_url = std::env::var("HELIUS_RPC_URL").expect("HELIUS_RPC_URL is not set");
-    let rpc_url=
-        std::env::var("TRITON_RPC_URL").expect("TRITON_RPC_BASE_URL is not set");
+    let rpc_url = std::env::var("TRITON_RPC_URL").expect("TRITON_RPC_BASE_URL is not set");
 
-    let dragon_mouth_base_url =
-        std::env::var("DRAGONS_MOUTH_BASE_URL").expect("DRAGONS_MOUTH_BASE_URL is not set");
-    let dragon_mouth_grpc_token =
-        std::env::var("DRAGONS_MOUTH_TOKEN").expect("DRAGONS_MOUTH_TOKEN is not set");
- 
+    let (dragon_mouth_base_url, dragon_mouth_grpc_token) = if triton {
+        info!("Using Triton Dragon's Mouth");
+        (
+            std::env::var("TRITON_DRAGONS_MOUTH_BASE_URL")
+                .expect("TRITON_DRAGONS_MOUTH_BASE_URL is not set"),
+            std::env::var("TRITON_DRAGONS_MOUTH_TOKEN")
+                .expect("TRITON_DRAGONS_MOUTH_TOKEN is not set"),
+        )
+    } else {
+        info!("Using Helius Dragon's Mouth");
+        (
+            std::env::var("HELIUS_DRAGONS_MOUTH_BASE_URL")
+                .expect("HELIUS_DRAGONS_MOUTH_BASE_URL is not set"),
+            std::env::var("HELIUS_DRAGONS_MOUTH_TOKEN")
+                .expect("HELIUS_DRAGONS_MOUTH_TOKEN is not set"),
+        )
+    };
+
     let rpc_client = Arc::new(rpc_client::RpcClient::new(rpc_url));
 
     info!("Connecting to Dragon's Mouth at {}", dragon_mouth_base_url);
 
     let tls_config = ClientTlsConfig::new().with_native_roots();
-    let mut client =
-        GeyserGrpcClient::build_from_shared(dragon_mouth_base_url)
-            .expect("build_from_shared failed")
-            .x_token(Some(dragon_mouth_grpc_token))
-            .expect("x-token failed")
-            .tls_config(tls_config)
-            .expect("tls config failed")
-            .connect()
-            .await
-            .expect("Failed to connect to geyser");
+    let mut client = GeyserGrpcClient::build_from_shared(dragon_mouth_base_url)
+        .expect("build_from_shared failed")
+        .x_token(Some(dragon_mouth_grpc_token))
+        .expect("x-token failed")
+        .tls_config(tls_config)
+        .expect("tls config failed")
+        .connect()
+        .await
+        .expect("Failed to connect to geyser");
 
     let mut transactions_map = HashMap::new();
     transactions_map.insert(
@@ -589,19 +625,8 @@ async fn generate_final_report(blocks: &Arc<Mutex<HashMap<u64, BlockInfo>>>) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Initialize tracing
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Failed to set default tracing subscriber");
-
     // Parse command line arguments
     let args = Args::parse();
 
-    info!(
-        "Starting Dragon's Mouth reliability test for {} minutes...",
-        args.duration
-    );
-    run_test(args.duration).await
+    run_test(args.duration, args.triton).await
 }
